@@ -14,7 +14,7 @@ The goal is a demo that looks and works like a real communication link. **There 
 - Two laptops. Each one has its own ESP32 connected over USB.
 - Each ESP32 has a laser (GPIO32, switched through an NPN transistor) and an IS203 light sensor (GPIO33, read with the ADC).
 - Board A's laser points at board B's sensor, and board B's laser points at board A's sensor, through **two separate light paths** (confirmed by the user). A board's own laser does not reach its own sensor. The firmware must not depend on which board is which.
-- PlatformIO project, `board = fm-devkit`, Arduino framework.
+- PlatformIO project, `board = esp32dev` (ESP32 DevKit / NodeMCU boards), Arduino framework.
 - Known-good values from the current code:
   - 1 kbps (`BIT_US = 1000`)
   - 12-bit ADC

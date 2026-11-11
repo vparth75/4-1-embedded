@@ -11,7 +11,7 @@ Two laptops, each with an ESP32 that has a laser (GPIO32) and an IS203 light sen
 With the PlatformIO CLI:
 
 ```bash
-pio run -e fm-devkit -t upload          # run once per board
+pio run -e esp32dev -t upload          # run once per board
 ```
 
 (If `pio` isn't on your PATH, use `~/.platformio/penv/bin/pio`.) In VS Code you can use the PlatformIO **Upload** button instead.
