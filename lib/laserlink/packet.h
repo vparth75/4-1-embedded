@@ -25,6 +25,8 @@ public:
     size_t length() const { return len_; }
     bool ok() const { return ok_; }
     void reset();
+    // True while waiting for a SYNC byte (no packet in progress).
+    bool idle() const { return state_ == WAIT_SYNC; }
 
 private:
     enum State { WAIT_SYNC, WAIT_LEN, PAYLOAD, WAIT_CRC };
