@@ -5,6 +5,9 @@
 #include "packet.h"
 #include "framer.h"
 #include "link_engine.h"
+#include "host_io.h"
+#include <ArduinoJson.h>
+#include <string>
 
 void setUp() {}
 void tearDown() {}
@@ -355,6 +358,163 @@ void test_engine_noise_before_packet_not_captured()
     TEST_ASSERT_EQUAL(5 * 10, pkt.adcCount);
 }
 
+
+// ---------- Task 3: host JSON protocol ----------
+
+static JsonDocument parseJson(const std::string& s)
+{
+    JsonDocument d;
+    TEST_ASSERT_EQUAL_MESSAGE(0, (int)deserializeJson(d, s).code(), s.c_str());
+    return d;
+}
+
+void test_bits_string()
+{
+    TEST_ASSERT_EQUAL_STRING("01101000 01101001", bitsString((const uint8_t*)"hi", 2).c_str());
+    TEST_ASSERT_EQUAL_STRING("", bitsString(nullptr, 0).c_str());
+}
+
+void test_hello_event_fields()
+{
+    JsonDocument d = parseJson(helloEvent(1500));
+    TEST_ASSERT_EQUAL_STRING("hello", d["evt"]);
+    TEST_ASSERT_EQUAL(1500, d["threshold"].as<int>());
+    TEST_ASSERT_EQUAL(1000, d["bit_us"].as<int>());
+    TEST_ASSERT_EQUAL_STRING("laser-chat 1.0", d["fw"]);
+}
+
+void test_handle_send_ok()
+{
+    LinkEngine eng;
+    HostActions act = {};
+    JsonDocument d = parseJson(handleCommand("{\"cmd\":\"send\",\"text\":\"hi\"}", eng, act));
+    TEST_ASSERT_EQUAL_STRING("sent", d["evt"]);
+    TEST_ASSERT_EQUAL_STRING("hi", d["text"]);
+    TEST_ASSERT_EQUAL_STRING("01101000 01101001", d["bits"]);
+    TEST_ASSERT_TRUE(eng.txBusy());
+}
+
+void test_handle_send_too_long()
+{
+    LinkEngine eng;
+    HostActions act = {};
+    std::string line = "{\"cmd\":\"send\",\"text\":\"" + std::string(65, 'a') + "\"}";
+    JsonDocument d = parseJson(handleCommand(line, eng, act));
+    TEST_ASSERT_EQUAL_STRING("error", d["evt"]);
+    TEST_ASSERT_EQUAL_STRING("message too long", d["msg"]);
+    TEST_ASSERT_FALSE(eng.txBusy());
+}
+
+void test_handle_send_64_ok()
+{
+    LinkEngine eng;
+    HostActions act = {};
+    std::string line = "{\"cmd\":\"send\",\"text\":\"" + std::string(64, 'a') + "\"}";
+    JsonDocument d = parseJson(handleCommand(line, eng, act));
+    TEST_ASSERT_EQUAL_STRING("sent", d["evt"]);
+}
+
+void test_handle_send_busy()
+{
+    LinkEngine eng;
+    HostActions act = {};
+    handleCommand("{\"cmd\":\"send\",\"text\":\"a\"}", eng, act);
+    JsonDocument d = parseJson(handleCommand("{\"cmd\":\"send\",\"text\":\"b\"}", eng, act));
+    TEST_ASSERT_EQUAL_STRING("error", d["evt"]);
+    TEST_ASSERT_EQUAL_STRING("busy", d["msg"]);
+}
+
+void test_handle_send_empty_rejected()
+{
+    LinkEngine eng;
+    HostActions act = {};
+    JsonDocument d = parseJson(handleCommand("{\"cmd\":\"send\",\"text\":\"\"}", eng, act));
+    TEST_ASSERT_EQUAL_STRING("error", d["evt"]);
+    TEST_ASSERT_FALSE(eng.txBusy());
+}
+
+void test_handle_hello()
+{
+    LinkEngine eng(1234);
+    HostActions act = {};
+    JsonDocument d = parseJson(handleCommand("{\"cmd\":\"hello\"}", eng, act));
+    TEST_ASSERT_EQUAL_STRING("hello", d["evt"]);
+    TEST_ASSERT_EQUAL(1234, d["threshold"].as<int>());
+    TEST_ASSERT_TRUE(act.sendHello);
+}
+
+void test_handle_set_threshold()
+{
+    LinkEngine eng;
+    HostActions act = {};
+    JsonDocument d = parseJson(handleCommand("{\"cmd\":\"set_threshold\",\"value\":1200}", eng, act));
+    TEST_ASSERT_EQUAL(1200, eng.threshold());
+    TEST_ASSERT_TRUE(act.thresholdChanged);
+    TEST_ASSERT_EQUAL(1200, act.newThreshold);
+    TEST_ASSERT_EQUAL_STRING("hello", d["evt"]);
+    TEST_ASSERT_EQUAL(1200, d["threshold"].as<int>());
+}
+
+void test_handle_set_threshold_out_of_range()
+{
+    const char* bad[] = {
+        "{\"cmd\":\"set_threshold\",\"value\":5000}",
+        "{\"cmd\":\"set_threshold\",\"value\":-1}",
+        "{\"cmd\":\"set_threshold\"}",
+        "{\"cmd\":\"set_threshold\",\"value\":\"12\"}",
+    };
+    for (const char* line : bad) {
+        LinkEngine eng;
+        HostActions act = {};
+        JsonDocument d = parseJson(handleCommand(line, eng, act));
+        TEST_ASSERT_EQUAL_STRING("error", d["evt"]);
+        TEST_ASSERT_EQUAL_STRING("bad threshold", d["msg"]);
+        TEST_ASSERT_EQUAL(2048, eng.threshold());
+        TEST_ASSERT_FALSE(act.thresholdChanged);
+    }
+}
+
+void test_handle_garbage()
+{
+    LinkEngine eng;
+    HostActions act = {};
+    const char* bad[] = {"abc{", "{\"cmd\":\"fly\"}", "[1,2]", ""};
+    for (const char* line : bad) {
+        JsonDocument d = parseJson(handleCommand(line, eng, act));
+        TEST_ASSERT_EQUAL_STRING("error", d["evt"]);
+        TEST_ASSERT_EQUAL_STRING("bad command", d["msg"]);
+    }
+}
+
+void test_recv_event_adc_array()
+{
+    RxPacket pkt = {};
+    memcpy(pkt.payload, "hi", 2);
+    pkt.len = 2;
+    pkt.ok = false;
+    pkt.adc[0] = 1; pkt.adc[1] = 2; pkt.adc[2] = 3;
+    pkt.adcCount = 3;
+    JsonDocument d = parseJson(recvEvent(pkt));
+    TEST_ASSERT_EQUAL_STRING("recv", d["evt"]);
+    TEST_ASSERT_FALSE(d["ok"].as<bool>());
+    TEST_ASSERT_EQUAL_STRING("hi", d["text"]);
+    TEST_ASSERT_EQUAL_STRING("01101000 01101001", d["bits"]);
+    JsonArray a = d["adc"];
+    TEST_ASSERT_EQUAL(3, a.size());
+    TEST_ASSERT_EQUAL(1, a[0].as<int>());
+    TEST_ASSERT_EQUAL(3, a[2].as<int>());
+}
+
+void test_events_are_single_line()
+{
+    RxPacket pkt = {};
+    memcpy(pkt.payload, "a\nb", 3);
+    pkt.len = 3;
+    pkt.ok = true;
+    std::string s = recvEvent(pkt);
+    TEST_ASSERT_EQUAL(std::string::npos, s.find('\n'));
+}
+
 int main(int, char**)
 {
     UNITY_BEGIN();
@@ -380,5 +540,18 @@ int main(int, char**)
     RUN_TEST(test_engine_full_duplex);
     RUN_TEST(test_engine_threshold_inverted_logic);
     RUN_TEST(test_engine_noise_before_packet_not_captured);
+    RUN_TEST(test_bits_string);
+    RUN_TEST(test_hello_event_fields);
+    RUN_TEST(test_handle_send_ok);
+    RUN_TEST(test_handle_send_too_long);
+    RUN_TEST(test_handle_send_64_ok);
+    RUN_TEST(test_handle_send_busy);
+    RUN_TEST(test_handle_send_empty_rejected);
+    RUN_TEST(test_handle_hello);
+    RUN_TEST(test_handle_set_threshold);
+    RUN_TEST(test_handle_set_threshold_out_of_range);
+    RUN_TEST(test_handle_garbage);
+    RUN_TEST(test_recv_event_adc_array);
+    RUN_TEST(test_events_are_single_line);
     return UNITY_END();
 }
