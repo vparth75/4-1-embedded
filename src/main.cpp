@@ -1,146 +1,52 @@
+// Laser Chat firmware: identical on both boards.
+// Laptop <-> ESP32: JSON lines over USB serial (115200).
+// ESP32 <-> ESP32: UART-style frames over laser (GPIO32) and IS203 sensor (GPIO33).
+
 #include <Arduino.h>
+#include <Preferences.h>
+#include <esp_timer.h>
+#include <string>
+
+#include "host_io.h"
+#include "link_engine.h"
 
 #define LASER_PIN 32
 #define RX_PIN    33
-
 #define BIT_US    1000
-#define THRESHOLD 2048
 
-#define MAX_MESSAGE 64
+static const int64_t TICK_US = BIT_US / TICKS_PER_BIT;   // 125 us
+static const size_t MAX_LINE = 512;
 
-String inputMessage = "";
+static LinkEngine engine;
+static Preferences prefs;
+static std::string lineBuf;
+static bool lineOverflow = false;
 
-
-// ============================================================
-// OPTICAL BIT
-// ============================================================
-
-bool transmitAndReceiveBit(bool txBit)
+// Runs forever on core 0: one tick = drive laser + sample sensor.
+static void linkTask(void*)
 {
-    digitalWrite(LASER_PIN, txBit ? HIGH : LOW);
-
-    delayMicroseconds(BIT_US / 2);
-
-    int adc = analogRead(RX_PIN);
-
-    bool rxBit = (adc < THRESHOLD);
-
-    delayMicroseconds(BIT_US / 2);
-
-    return rxBit;
-}
-
-
-// ============================================================
-// BYTE
-// ============================================================
-
-uint8_t transmitAndReceiveByte(uint8_t txByte)
-{
-    uint8_t rxByte = 0;
-
-    for (int bit = 7; bit >= 0; bit--)
-    {
-        bool txBit = (txByte >> bit) & 1;
-
-        bool rxBit = transmitAndReceiveBit(txBit);
-
-        rxByte <<= 1;
-
-        if (rxBit)
-        {
-            rxByte |= 1;
+    int64_t next = esp_timer_get_time();
+    for (;;) {
+        next += TICK_US;
+        int64_t now;
+        while ((now = esp_timer_get_time()) < next) {
         }
-    }
-
-    return rxByte;
-}
-
-
-// ============================================================
-// SEND MESSAGE
-// ============================================================
-
-void opticalLoopback(String message)
-{
-    Serial.println();
-    Serial.println("================================");
-    Serial.println("TRANSMITTING");
-    Serial.println("================================");
-
-    Serial.print("TX: ");
-    Serial.println(message);
-
-    String receivedMessage = "";
-
-    int totalBits = 0;
-    int errors = 0;
-
-    for (int i = 0; i < message.length(); i++)
-    {
-        uint8_t txByte = (uint8_t)message[i];
-        uint8_t rxByte = 0;
-
-        for (int bit = 7; bit >= 0; bit--)
-        {
-            bool txBit = (txByte >> bit) & 1;
-
-            bool rxBit = transmitAndReceiveBit(txBit);
-
-            rxByte <<= 1;
-
-            if (rxBit)
-            {
-                rxByte |= 1;
-            }
-
-            totalBits++;
-
-            if (txBit != rxBit)
-            {
-                errors++;
-            }
+        if (now - next > TICK_US) {
+            next = now;   // fell behind: resync instead of bursting
         }
-
-        receivedMessage += (char)rxByte;
+        uint16_t adc = analogRead(RX_PIN);
+        bool laser = engine.tick(adc, millis());
+        digitalWrite(LASER_PIN, laser ? HIGH : LOW);
     }
-
-    digitalWrite(LASER_PIN, LOW);
-
-    Serial.println();
-    Serial.println("================================");
-    Serial.println("DECODED RESULT");
-    Serial.println("================================");
-
-    Serial.print("TX: ");
-    Serial.println(message);
-
-    Serial.print("RX: ");
-    Serial.println(receivedMessage);
-
-    Serial.print("Bits: ");
-    Serial.println(totalBits);
-
-    Serial.print("Errors: ");
-    Serial.println(errors);
-
-    if (receivedMessage == message && errors == 0)
-    {
-        Serial.println("RESULT: PASS");
-    }
-    else
-    {
-        Serial.println("RESULT: FAIL");
-    }
-
-    Serial.println();
-    Serial.println("Type another message:");
 }
 
-
-// ============================================================
-// SETUP
-// ============================================================
+static void sendLine(const std::string& s)
+{
+    if (!s.empty()) {
+        Serial.write((const uint8_t*)s.data(), s.size());
+        Serial.write('\n');
+    }
+}
 
 void setup()
 {
@@ -148,65 +54,54 @@ void setup()
 
     pinMode(LASER_PIN, OUTPUT);
     digitalWrite(LASER_PIN, LOW);
-
     analogReadResolution(12);
+    analogSetPinAttenuation(RX_PIN, ADC_11db);
 
-    delay(500);
+    prefs.begin("laser", false);
+    uint16_t thr = prefs.getUShort("thr", 2048);
+    if (thr > 4095) {
+        thr = 2048;
+    }
+    engine.setThreshold(thr);
 
-    Serial.println();
-    Serial.println("================================");
-    Serial.println(" SAME ESP32 OPTICAL TERMINAL");
-    Serial.println("================================");
-    Serial.println();
-    Serial.println("TX: GPIO32 -> LASER");
-    Serial.println("RX: GPIO33 <- IS203");
-    Serial.println("RATE: 1 kbps");
-    Serial.println();
-    Serial.println("READY");
-    Serial.println("Type your message below and press ENTER.");
-    Serial.println();
+    delay(200);
+    sendLine(helloEvent(engine.threshold()));
+
+    // The link task never sleeps, so the core 0 idle watchdog must be off.
+    disableCore0WDT();
+    xTaskCreatePinnedToCore(linkTask, "link", 4096, nullptr, configMAX_PRIORITIES - 1, nullptr, 0);
 }
-
-
-// ============================================================
-// TERMINAL
-// ============================================================
 
 void loop()
 {
-    if (Serial.available() > 0)
-    {
-        char c = Serial.read();
-
-        // Print the character back so we know
-        // the ESP32 actually received it.
-        if (c != '\r' && c != '\n')
-        {
-            Serial.print(c);
+    while (Serial.available() > 0) {
+        char c = (char)Serial.read();
+        if (c == '\r') {
+            continue;
         }
-
-        // ENTER
-        if (c == '\n' || c == '\r')
-        {
-            if (inputMessage.length() > 0)
-            {
-                String message = inputMessage;
-
-                inputMessage = "";
-
-                Serial.println();
-
-                opticalLoopback(message);
+        if (c == '\n') {
+            if (!lineOverflow && !lineBuf.empty()) {
+                HostActions act;
+                sendLine(handleCommand(lineBuf, engine, act));
+                if (act.thresholdChanged) {
+                    prefs.putUShort("thr", act.newThreshold);
+                }
             }
+            lineBuf.clear();
+            lineOverflow = false;
+            continue;
         }
-
-        // Normal character
-        else
-        {
-            if (inputMessage.length() < MAX_MESSAGE)
-            {
-                inputMessage += c;
-            }
+        if (lineBuf.size() < MAX_LINE) {
+            lineBuf += c;
+        } else {
+            lineOverflow = true;
         }
     }
+
+    static RxPacket pkt;
+    while (engine.takeReceived(pkt)) {
+        sendLine(recvEvent(pkt));
+    }
+
+    delay(1);
 }

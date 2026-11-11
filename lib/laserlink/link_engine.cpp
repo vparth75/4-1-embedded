@@ -1,18 +1,39 @@
 #include "link_engine.h"
 #include <string.h>
 
+#if defined(ESP_PLATFORM)
+#include <freertos/FreeRTOS.h>
+static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
+#define LL_LOCK() portENTER_CRITICAL(&s_mux)
+#define LL_UNLOCK() portEXIT_CRITICAL(&s_mux)
+#else
+#define LL_LOCK()
+#define LL_UNLOCK()
+#endif
+
+void LinkEngine::setThreshold(uint16_t t)
+{
+    LL_LOCK();
+    threshold_ = t;
+    LL_UNLOCK();
+}
+
 bool LinkEngine::sendPayload(const uint8_t* p, size_t n)
 {
-    if (tx_.busy() || n > MAX_PAYLOAD) {
+    if (n > MAX_PAYLOAD) {
         return false;
     }
     uint8_t wire[MAX_PACKET];
     size_t len = buildPacket(p, n, wire);
-    return tx_.load(wire, len);
+    LL_LOCK();
+    bool ok = tx_.load(wire, len);
+    LL_UNLOCK();
+    return ok;
 }
 
 bool LinkEngine::tick(uint16_t adc, uint32_t nowMs)
 {
+    LL_LOCK();
     // Sensor reads low when the laser light hits it.
     bool level = adc < threshold_;
 
@@ -45,16 +66,20 @@ bool LinkEngine::tick(uint16_t adc, uint32_t nowMs)
         }
     }
 
-    return tx_.tick();
+    bool out = tx_.tick();
+    LL_UNLOCK();
+    return out;
 }
 
 bool LinkEngine::takeReceived(RxPacket& out)
 {
-    if (count_ == 0) {
-        return false;
+    LL_LOCK();
+    bool have = count_ > 0;
+    if (have) {
+        out = queue_[head_];
+        head_ = (head_ + 1) % QUEUE;
+        count_--;
     }
-    out = queue_[head_];
-    head_ = (head_ + 1) % QUEUE;
-    count_--;
-    return true;
+    LL_UNLOCK();
+    return have;
 }

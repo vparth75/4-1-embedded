@@ -15,11 +15,13 @@ struct RxPacket {
 // Ties TX framing, RX framing and packet parsing together.
 // Call tick() at TICKS_PER_BIT ticks per bit with the latest sensor reading;
 // it returns the laser level to output.
+// On ESP32, tick() may run on one core while the other methods run on the other:
+// they share a short internal spinlock.
 class LinkEngine {
 public:
     explicit LinkEngine(uint16_t threshold = 2048) : threshold_(threshold) {}
 
-    void setThreshold(uint16_t t) { threshold_ = t; }
+    void setThreshold(uint16_t t);
     uint16_t threshold() const { return threshold_; }
 
     bool sendPayload(const uint8_t* p, size_t n);
