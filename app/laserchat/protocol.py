@@ -57,7 +57,8 @@ def parse_line(line: str | bytes) -> Event | None:
     if not line.startswith("{"):
         return None
     try:
-        d = json.loads(line)
+        # strict=False: firmware leaves most control bytes unescaped (e.g. corrupted text).
+        d = json.loads(line, strict=False)
     except ValueError:
         return None
     if not isinstance(d, dict):

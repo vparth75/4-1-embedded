@@ -173,3 +173,30 @@ def test_window_user_disconnect_stops_worker(win):
     QTest.mouseClick(win.connect_button, Qt.LeftButton)
     assert fake.stopped
     assert win.status == "disconnected"
+
+
+def test_window_busy_is_retried(win):
+    fake = go_online(win)
+    win.busy_retry_ms = 10
+    win.input_edit.setText("hi")
+    win.send_button.click()
+    msg = win.model.messages[-1]
+    win.handle_line(line({"evt": "error", "msg": "busy"}))
+    assert msg.status == "pending"
+    QTest.qWait(100)
+    assert fake.writes.count(cmd_send("hi")) == 2
+    win.handle_line(line({"evt": "sent", "text": "hi", "bits": ""}))
+    assert msg.status == "sent"
+
+
+def test_window_busy_gives_up_after_max_retries(win):
+    go_online(win)
+    win.busy_retry_ms = 1
+    win.busy_max_retries = 2
+    win.input_edit.setText("hi")
+    win.send_button.click()
+    msg = win.model.messages[-1]
+    for _ in range(3):
+        win.handle_line(line({"evt": "error", "msg": "busy"}))
+        QTest.qWait(20)
+    assert msg.status == "failed"

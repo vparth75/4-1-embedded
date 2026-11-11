@@ -90,3 +90,34 @@ def test_worker_emits_lines(qapp):
     assert w.wait(2000)
     qapp.processEvents()
     assert got == [b'{"evt":"hello"}\n', b"x\n"]
+
+
+def test_worker_write_before_port_open_is_delivered(qapp):
+    import threading
+    import time
+
+    written = []
+    opened = threading.Event()
+
+    class Slow:
+        def __init__(self, *a, **k):
+            time.sleep(0.05)          # port takes a moment to open
+            opened.set()
+
+        def readline(self):
+            time.sleep(0.01)
+            if len(written) > 0:
+                raise serial.SerialException("done")
+            return b""
+
+        def write(self, data):
+            written.append(data)
+
+        def close(self):
+            pass
+
+    w = SerialWorker("X", opener=Slow)
+    w.start()
+    w.write(b'{"cmd":"hello"}\n')      # called right after start(), before open finishes
+    assert w.wait(2000)
+    assert written == [b'{"cmd":"hello"}\n']

@@ -29,6 +29,7 @@ class SerialWorker(QThread):
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._reported = False
+        self._backlog: list[bytes] = []   # writes made before the port finished opening
 
     def _report(self, reason: str) -> None:
         # Emit at most once, and not after a user-requested stop.
@@ -42,9 +43,12 @@ class SerialWorker(QThread):
         except (serial.SerialException, OSError, ValueError) as exc:
             self._report(str(exc))
             return
-        with self._lock:
-            self._ser = ser
         try:
+            with self._lock:
+                self._ser = ser
+                backlog, self._backlog = self._backlog, []
+                for data in backlog:
+                    ser.write(data)
             while not self._stop.is_set():
                 line = ser.readline()
                 if line:
@@ -63,6 +67,8 @@ class SerialWorker(QThread):
         with self._lock:
             ser = self._ser
             if ser is None:
+                if not self._stop.is_set():
+                    self._backlog.append(data)
                 return
             try:
                 ser.write(data)

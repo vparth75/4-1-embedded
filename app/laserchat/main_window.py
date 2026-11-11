@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
@@ -57,6 +57,11 @@ class MainWindow(QMainWindow):
         self._threshold = 2048
         self.model = ChatModel()
         self.status = "disconnected"
+        # The board refuses a send while it is still transmitting the previous one;
+        # retry instead of failing the message.
+        self.busy_retry_ms = 300
+        self.busy_max_retries = 10
+        self._retries: dict[int, int] = {}
 
         central = QWidget()
         root = QVBoxLayout(central)
@@ -212,6 +217,8 @@ class MainWindow(QMainWindow):
             self.threshold_spin.setValue(event.threshold)
             self.set_status("online")
             return
+        if isinstance(event, DeviceError) and event.msg == "busy" and self._retry_busy():
+            return
         msg = self.model.apply(event)
         if msg is None:
             if isinstance(event, DeviceError):
@@ -250,6 +257,25 @@ class MainWindow(QMainWindow):
         self.chat_view.add_message(msg)
         self.input_edit.clear()
         self._worker.write(data)
+
+    def _retry_busy(self) -> bool:
+        msg = next((m for m in self.model.messages if m.status == "pending"), None)
+        if msg is None:
+            return False
+        tries = self._retries.get(id(msg), 0)
+        if tries >= self.busy_max_retries:
+            self._retries.pop(id(msg), None)
+            return False
+        self._retries[id(msg)] = tries + 1
+        QTimer.singleShot(self.busy_retry_ms, self, lambda m=msg: self._resend(m))
+        return True
+
+    def _resend(self, msg: ChatMessage) -> None:
+        if msg.status == "pending" and self._worker is not None:
+            try:
+                self._worker.write(cmd_send(msg.text))
+            except ValueError:
+                pass
 
     def _apply_threshold(self) -> None:
         if self._worker is not None:

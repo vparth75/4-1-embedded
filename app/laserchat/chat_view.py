@@ -94,7 +94,7 @@ class ChatView(QScrollArea):
             row.addStretch(1)
         self._layout.addLayout(row)
         self._bubbles[id(msg)] = bubble
-        QTimer.singleShot(0, self._scroll_to_bottom)
+        QTimer.singleShot(0, self, self._scroll_to_bottom)
 
     def update_message(self, msg: ChatMessage) -> None:
         bubble = self._bubbles.get(id(msg))

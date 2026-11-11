@@ -66,3 +66,10 @@ def test_cmd_set_threshold_range():
         cmd_set_threshold(4096)
     with pytest.raises(ValueError):
         cmd_set_threshold(-1)
+
+
+def test_parse_recv_with_raw_control_bytes():
+    # Firmware writes bytes 0x01-0x1F (except \b\t\n\f\r) unescaped inside strings.
+    e = parse_line(b'{"evt":"recv","ok":false,"text":"Cxx\x03y\x1b","bits":"","adc":[]}\n')
+    assert isinstance(e, Recv)
+    assert e.ok is False
