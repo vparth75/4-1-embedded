@@ -1,212 +1,178 @@
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
 
-#define LASER_PIN 32
-#define RX_PIN    33
+constexpr int LASER_PIN = 32;
+constexpr int RX_PIN = 33;
+constexpr int THRESHOLD = 2048;
+constexpr uint32_t BIT_US = 1000;       // 1 kbps
+constexpr uint32_t MARK_US = 5000;
+constexpr uint32_t GAP_US = 2000;
+constexpr uint32_t QUIET_US = 12000;
+constexpr uint8_t MAX_LEN = 64;
 
-#define BIT_US    1000
-#define THRESHOLD 2048
+struct Message {
+    uint8_t length;
+    uint8_t data[MAX_LEN];
+};
 
-#define MAX_MESSAGE 64
+QueueHandle_t txQueue;
+Message input{};
+bool lineTooLong = false;
+uint32_t lastOn;
 
-String inputMessage = "";
-
-
-// ============================================================
-// OPTICAL BIT
-// ============================================================
-
-bool transmitAndReceiveBit(bool txBit)
+void waitUntil(uint32_t deadline)
 {
-    digitalWrite(LASER_PIN, txBit ? HIGH : LOW);
-
-    delayMicroseconds(BIT_US / 2);
-
-    int adc = analogRead(RX_PIN);
-
-    bool rxBit = (adc < THRESHOLD);
-
-    delayMicroseconds(BIT_US / 2);
-
-    return rxBit;
+    while (static_cast<int32_t>(micros() - deadline) < 0) {}
 }
 
-
-// ============================================================
-// BYTE
-// ============================================================
-
-uint8_t transmitAndReceiveByte(uint8_t txByte)
+void sendByte(uint8_t value, uint32_t &deadline)
 {
-    uint8_t rxByte = 0;
+    for (int bit = 7; bit >= 0; --bit) {
+        waitUntil(deadline);
+        digitalWrite(LASER_PIN, (value >> bit) & 1);
+        deadline += BIT_US;
+    }
+}
 
-    for (int bit = 7; bit >= 0; bit--)
-    {
-        bool txBit = (txByte >> bit) & 1;
+void txTask(void *)
+{
+    Message msg;
 
-        bool rxBit = transmitAndReceiveBit(txBit);
+    for (;;) {
+        xQueueReceive(txQueue, &msg, portMAX_DELAY);
 
-        rxByte <<= 1;
+        // Leave enough dark time for the other receiver to re-arm.
+        vTaskDelay(pdMS_TO_TICKS(25));
 
-        if (rxBit)
-        {
-            rxByte |= 1;
+        digitalWrite(LASER_PIN, HIGH);
+        delayMicroseconds(MARK_US);
+        digitalWrite(LASER_PIN, LOW);
+
+        uint32_t deadline = micros() + GAP_US;
+        uint8_t checksum = msg.length;
+
+        sendByte(msg.length, deadline);
+        for (uint8_t i = 0; i < msg.length; ++i) {
+            checksum ^= msg.data[i];
+            sendByte(msg.data[i], deadline);
+        }
+        sendByte(checksum, deadline);
+
+        waitUntil(deadline);
+        digitalWrite(LASER_PIN, LOW);
+    }
+}
+
+bool laserOn()
+{
+    return analogRead(RX_PIN) < THRESHOLD;
+}
+
+uint8_t readByte(uint32_t &deadline)
+{
+    uint8_t value = 0;
+    for (int bit = 0; bit < 8; ++bit) {
+        waitUntil(deadline);
+        value = (value << 1) | laserOn();
+        deadline += BIT_US;
+    }
+    return value;
+}
+
+void receiveOptical()
+{
+    if (!laserOn()) return;
+
+    const uint32_t start = micros();
+    const bool wasQuiet = start - lastOn >= QUIET_US;
+    lastOn = start;
+    if (!wasQuiet) return;
+
+    while (laserOn()) {
+        if (micros() - start > 7000) {
+            lastOn = micros();
+            return;
         }
     }
 
-    return rxByte;
-}
+    const uint32_t fallingEdge = micros();
+    lastOn = fallingEdge;
+    if (fallingEdge - start < 4000) return;
 
+    uint32_t deadline = fallingEdge + GAP_US + BIT_US / 2;
+    Message msg;
+    msg.length = readByte(deadline);
 
-// ============================================================
-// SEND MESSAGE
-// ============================================================
-
-void opticalLoopback(String message)
-{
-    Serial.println();
-    Serial.println("================================");
-    Serial.println("TRANSMITTING");
-    Serial.println("================================");
-
-    Serial.print("TX: ");
-    Serial.println(message);
-
-    String receivedMessage = "";
-
-    int totalBits = 0;
-    int errors = 0;
-
-    for (int i = 0; i < message.length(); i++)
-    {
-        uint8_t txByte = (uint8_t)message[i];
-        uint8_t rxByte = 0;
-
-        for (int bit = 7; bit >= 0; bit--)
-        {
-            bool txBit = (txByte >> bit) & 1;
-
-            bool rxBit = transmitAndReceiveBit(txBit);
-
-            rxByte <<= 1;
-
-            if (rxBit)
-            {
-                rxByte |= 1;
-            }
-
-            totalBits++;
-
-            if (txBit != rxBit)
-            {
-                errors++;
-            }
-        }
-
-        receivedMessage += (char)rxByte;
+    if (msg.length == 0 || msg.length > MAX_LEN) {
+        lastOn = micros();
+        Serial.println("RX: invalid length");
+        return;
     }
 
-    digitalWrite(LASER_PIN, LOW);
+    uint8_t checksum = msg.length;
+    for (uint8_t i = 0; i < msg.length; ++i) {
+        msg.data[i] = readByte(deadline);
+        checksum ^= msg.data[i];
+    }
 
-    Serial.println();
-    Serial.println("================================");
-    Serial.println("DECODED RESULT");
-    Serial.println("================================");
+    const uint8_t receivedChecksum = readByte(deadline);
+    lastOn = micros();
 
-    Serial.print("TX: ");
-    Serial.println(message);
+    if (receivedChecksum != checksum) {
+        Serial.println("RX: checksum error");
+        return;
+    }
 
     Serial.print("RX: ");
-    Serial.println(receivedMessage);
-
-    Serial.print("Bits: ");
-    Serial.println(totalBits);
-
-    Serial.print("Errors: ");
-    Serial.println(errors);
-
-    if (receivedMessage == message && errors == 0)
-    {
-        Serial.println("RESULT: PASS");
-    }
-    else
-    {
-        Serial.println("RESULT: FAIL");
-    }
-
+    Serial.write(msg.data, msg.length);
     Serial.println();
-    Serial.println("Type another message:");
 }
 
+void readTerminal()
+{
+    // Process one character per pass so pasted text doesn't starve ADC polling.
+    const int c = Serial.read();
+    if (c < 0) return;
 
-// ============================================================
-// SETUP
-// ============================================================
+    if (c == '\r' || c == '\n') {
+        if (lineTooLong) {
+            Serial.println("TX: line too long (64 bytes max)");
+        } else if (input.length && xQueueSend(txQueue, &input, 0) != pdTRUE) {
+            Serial.println("TX: queue full; line not sent");
+        }
+        input.length = 0;
+        lineTooLong = false;
+    } else if (input.length < MAX_LEN) {
+        input.data[input.length++] = static_cast<uint8_t>(c);
+    } else {
+        lineTooLong = true;
+    }
+}
 
 void setup()
 {
     Serial.begin(115200);
-
     pinMode(LASER_PIN, OUTPUT);
     digitalWrite(LASER_PIN, LOW);
-
     analogReadResolution(12);
 
-    delay(500);
+    txQueue = xQueueCreate(2, sizeof(Message));
+    const BaseType_t txCore = 1 - xPortGetCoreID();
+    if (!txQueue ||
+        xTaskCreatePinnedToCore(txTask, "opticalTX", 3072, nullptr,
+                                1, nullptr, txCore) != pdPASS) {
+        Serial.println("TX initialization failed");
+        for (;;) delay(1000);
+    }
 
-    Serial.println();
-    Serial.println("================================");
-    Serial.println(" SAME ESP32 OPTICAL TERMINAL");
-    Serial.println("================================");
-    Serial.println();
-    Serial.println("TX: GPIO32 -> LASER");
-    Serial.println("RX: GPIO33 <- IS203");
-    Serial.println("RATE: 1 kbps");
-    Serial.println();
-    Serial.println("READY");
-    Serial.println("Type your message below and press ENTER.");
-    Serial.println();
+    lastOn = micros();
+    Serial.println("Optical link ready. Type a line and press Enter.");
 }
-
-
-// ============================================================
-// TERMINAL
-// ============================================================
 
 void loop()
 {
-    if (Serial.available() > 0)
-    {
-        char c = Serial.read();
-
-        // Print the character back so we know
-        // the ESP32 actually received it.
-        if (c != '\r' && c != '\n')
-        {
-            Serial.print(c);
-        }
-
-        // ENTER
-        if (c == '\n' || c == '\r')
-        {
-            if (inputMessage.length() > 0)
-            {
-                String message = inputMessage;
-
-                inputMessage = "";
-
-                Serial.println();
-
-                opticalLoopback(message);
-            }
-        }
-
-        // Normal character
-        else
-        {
-            if (inputMessage.length() < MAX_MESSAGE)
-            {
-                inputMessage += c;
-            }
-        }
-    }
+    receiveOptical();
+    readTerminal();
 }
